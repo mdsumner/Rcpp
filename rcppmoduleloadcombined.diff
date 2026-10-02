@@ -1,0 +1,491 @@
+diff --git a/R/00_classes.R b/R/00_classes.R
+index 589d3a8..115bd70 100644
+--- a/R/00_classes.R
++++ b/R/00_classes.R
+@@ -24,47 +24,72 @@ setClassUnion("refGenerator", c("refObjectGenerator", "refClassGeneratorFunction
+ ## Stands in for a reference class with those fields.
+ setClass( "Module",  contains = "environment" )
+ 
+-setRefClass( "C++Field", 
+-    fields = list( 
+-        pointer       = "externalptr", 
+-        cpp_class     = "character", 
+-        read_only     = "logical", 
+-        class_pointer = "externalptr", 
++## Plain S4 classes describing the fields, methods and constructors that a
++## C++ class exposes. These used to be reference classes; creating one
++## reference-class object per exposed method (via new()) dominated the
++## time spent loading a module. A "$" method is provided below so that
++## existing code using field-style access (x$pointer, x$info()) keeps working.
++setClass( "C++Field",
++    representation(
++        pointer       = "externalptr",
++        cpp_class     = "character",
++        read_only     = "logical",
++        class_pointer = "externalptr",
+         docstring     = "character"
+     )
+ )
+ 
+-setRefClass( "C++OverloadedMethods", 
+-    fields = list( 
+-        pointer       = "externalptr", 
+-        class_pointer = "externalptr", 
+-        size          = "integer", 
++setClass( "C++OverloadedMethods",
++    representation(
++        pointer       = "externalptr",
++        class_pointer = "externalptr",
++        size          = "integer",
+         void          = "logical",
+-        const         = "logical", 
+-        docstrings    = "character", 
+-        signatures    = "character", 
++        const         = "logical",
++        docstrings    = "character",
++        signatures    = "character",
+         nargs         = "integer"
+-    ), 
+-    methods = list( 
+-        info = function(prefix = "    " ){
+-             paste( 
+-                paste( prefix, signatures, ifelse(const, " const", "" ), "\n", prefix, prefix, 
+-                    ifelse( nchar(docstrings), paste( "docstring :", docstrings) , "" ) 
+-                ) , collapse = "\n" )   
+-        }
+     )
+ )
+ 
+-setRefClass( "C++Constructor", 
+-    fields = list( 
+-        pointer       = "externalptr", 
+-        class_pointer = "externalptr", 
+-        nargs         = "integer", 
+-        signature     = "character", 
++setClass( "C++Constructor",
++    representation(
++        pointer       = "externalptr",
++        class_pointer = "externalptr",
++        nargs         = "integer",
++        signature     = "character",
+         docstring     = "character"
+     )
+ )
+ 
++## formerly the 'info' reference method of C++OverloadedMethods
++.cpp_methods_info <- function( x, prefix = "    " ){
++    paste(
++        paste( prefix, x@signatures, ifelse(x@const, " const", "" ), "\n", prefix, prefix,
++            ifelse( nchar(x@docstrings), paste( "docstring :", x@docstrings) , "" )
++        ) , collapse = "\n" )
++}
++
++## backwards compatible field-style access
++setMethod( "$", "C++OverloadedMethods", function(x, name){
++    if( identical( name, "info" ) )
++        function( prefix = "    " ) .cpp_methods_info( x, prefix )
++    else
++        methods::slot( x, name )
++} )
++setMethod( "$", "C++Field",       function(x, name) methods::slot( x, name ) )
++setMethod( "$", "C++Constructor", function(x, name) methods::slot( x, name ) )
++
++## packages compiled against earlier versions of the Rcpp headers populate
++## these objects with `$<-` (FieldProxy); keep those binaries loadable
++.slot_dollar_assign <- function(x, name, value) {
++    methods::slot( x, name ) <- value
++    x
++}
++setReplaceMethod( "$", "C++OverloadedMethods", .slot_dollar_assign )
++setReplaceMethod( "$", "C++Field",             .slot_dollar_assign )
++setReplaceMethod( "$", "C++Constructor",       .slot_dollar_assign )
++
+ setClass( "C++Class", 
+ 	representation( 
+ 	    pointer      = "externalptr", 
+diff --git a/R/01_show.R b/R/01_show.R
+index 7d88ebc..4a74108 100644
+--- a/R/01_show.R
++++ b/R/01_show.R
+@@ -41,8 +41,8 @@ setMethod( "show", "C++Class", function(object){
+ 	txt <- character( nctors )
+ 	for( i in seq_len(nctors) ){
+ 	    ctor <- ctors[[i]]
+-	    doc  <- ctor$docstring
+-	    txt[i] <- sprintf( "    %s%s", ctor$signature, if( nchar(doc) ) sprintf( "\n        docstring : %s", doc) else "" )
++	    doc  <- ctor@docstring
++	    txt[i] <- sprintf( "    %s%s", ctor@signature, if( nchar(doc) ) sprintf( "\n        docstring : %s", doc) else "" )
+ 	}
+ 	writeLines( "Constructors:" )
+ 	writeLines( paste( txt, collapse = "\n" ) )
+@@ -55,11 +55,11 @@ setMethod( "show", "C++Class", function(object){
+ 	    writeLines( "\nFields: " )
+ 	    for( i in seq_len(nfields) ){
+ 	        f <- fields[[i]]
+-	        doc <- f$docstring
++	        doc <- f@docstring
+ 	        txt[i] <- sprintf( "    %s %s%s%s",
+-	            f$cpp_class, 
++	            f@cpp_class, 
+ 	            names[i], 
+-	            if( f$read_only ) " [readonly]" else "", 
++	            if( f@read_only ) " [readonly]" else "", 
+ 	            if( nchar(doc) ) sprintf( "\n        docstring : %s", doc ) else ""
+ 	        )    
+ 	    }
+@@ -74,7 +74,7 @@ setMethod( "show", "C++Class", function(object){
+ 	    writeLines( "\nMethods: " )
+ 	    txt <- character( nmethods )
+ 	    for( i in seq_len(nmethods) ){
+-	        txt[i] <- mets[[i]]$info("    ")
++	        txt[i] <- .cpp_methods_info( mets[[i]], "    " )
+ 	    }
+ 	    writeLines( paste( txt, collapse = "\n" ) ) 
+ 	} else {
+diff --git a/R/Module.R b/R/Module.R
+index e026801..45df291 100644
+--- a/R/Module.R
++++ b/R/Module.R
+@@ -222,15 +222,12 @@ Module <- function( module, PACKAGE = methods::getPackageName(where), where = to
+ 
+         fields <- cpp_fields( CLASS, where )
+         methods <- cpp_refMethods(CLASS, where)
+-        generator <- methods::setRefClass( clname,
+-                                 fields = fields,
+-                                 contains = "C++Object",
+-                                 methods = methods,
+-                                 where = where
+-                                 )
+         # just to make codetools happy
+         .self <- .refClassDef <- NULL
+-        generator$methods(initialize =
++        # Supply 'initialize' together with the other methods so that the
++        # reference class is analysed once, instead of a second full pass
++        # through refClassInformation() in generator$methods(...)
++        methods[["initialize"]] <-
+               if (cpp_hasDefaultConstructor(CLASS))
+                  function(...) Rcpp::cpp_object_initializer(.self,.refClassDef, ...)
+               else
+@@ -238,8 +235,13 @@ Module <- function( module, PACKAGE = methods::getPackageName(where), where = to
+                      if (nargs()) Rcpp::cpp_object_initializer(.self,.refClassDef, ...)
+                      else Rcpp::cpp_object_dummy(.self, .refClassDef) 			# #nocov
+                  }
+-                          )
+         rm( .self, .refClassDef )
++        generator <- methods::setRefClass( clname,
++                                 fields = fields,
++                                 contains = "C++Object",
++                                 methods = methods,
++                                 where = where
++                                 )
+ 
+         classDef <- methods::getClass(clname)
+         ## non-public (static) fields in class representation
+@@ -281,7 +283,10 @@ Module <- function( module, PACKAGE = methods::getPackageName(where), where = to
+         CLASS <- classes[[i]]
+         clname <- CLASS@.Data
+         demangled_name <- sub( "^Rcpp_", "", clname )
+-        .classes_map[[ CLASS@typeid ]] <- storage[[ demangled_name ]] <- .get_Module_Class( module, demangled_name, xp )
++        # reuse the C++Class object already built by Module__classes_info
++        # rather than rebuilding it (and all of its method/field objects)
++        CLASS@generator <- generators[[ clname ]]
++        .classes_map[[ CLASS@typeid ]] <- storage[[ demangled_name ]] <- CLASS
+ 
+         # exposing enums values as CLASS.VALUE
+         # (should really be CLASS$value but I don't know how to do it)
+@@ -324,15 +329,15 @@ Module <- function( module, PACKAGE = methods::getPackageName(where), where = to
+ dealWith <- function( x ) if(isTRUE(x[[1]])) invisible(NULL) else x[[2]]        # #nocov
+ 
+ method_wrapper <- function( METHOD, where ){
+-        noargs <- all( METHOD$nargs == 0 )
++        noargs <- all( METHOD@nargs == 0 )
+         stuff <- list(
+-            class_pointer = METHOD$class_pointer,
+-            pointer = METHOD$pointer,
++            class_pointer = METHOD@class_pointer,
++            pointer = METHOD@pointer,
+             CppMethod__invoke = CppMethod__invoke,
+             CppMethod__invoke_void = CppMethod__invoke_void,
+             CppMethod__invoke_notvoid = CppMethod__invoke_notvoid,
+             dealWith = dealWith,
+-            docstring = METHOD$info("")
++            docstring = .cpp_methods_info( METHOD, "" )
+         )
+         f <- function(...) NULL
+         if( noargs ){
+@@ -340,7 +345,7 @@ method_wrapper <- function( METHOD, where ){
+         }
+ 
+         extCall <- if( noargs ) {
+-            if( all( METHOD$void ) ){
++            if( all( METHOD@void ) ){
+                 # all methods are void, so we know we want to return invisible(NULL)
+                 substitute(
+                 {
+@@ -348,7 +353,7 @@ method_wrapper <- function( METHOD, where ){
+                     .External(CppMethod__invoke_void, class_pointer, pointer, .pointer )
+                     invisible(NULL)
+                 } , stuff )
+-            } else if( all( ! METHOD$void ) ){
++            } else if( all( ! METHOD@void ) ){
+                 # none of the methods are void so we always return the result of
+                 # .External
+                 substitute(
+@@ -366,7 +371,7 @@ method_wrapper <- function( METHOD, where ){
+                 } , stuff )                                                     # #nocov end
+             }
+         } else {
+-            if( all( METHOD$void ) ){
++            if( all( METHOD@void ) ){
+                 # all methods are void, so we know we want to return invisible(NULL)
+                 substitute(
+                 {
+@@ -374,7 +379,7 @@ method_wrapper <- function( METHOD, where ){
+                     .External(CppMethod__invoke_void, class_pointer, pointer, .pointer, ...)
+                     invisible(NULL)
+                 } , stuff )
+-            } else if( all( ! METHOD$void ) ){
++            } else if( all( ! METHOD@void ) ){
+                 # none of the methods are void so we always return the result of
+                 # .External
+                 substitute(
+@@ -426,8 +431,8 @@ binding_maker <- function( FIELD, where ){
+             .Call( CppField__get, class_pointer, pointer, .pointer)
+         else
+             .Call( CppField__set, class_pointer, pointer, .pointer, x)
+-    }, list(class_pointer = FIELD$class_pointer,
+-            pointer = FIELD$pointer,
++    }, list(class_pointer = FIELD@class_pointer,
++            pointer = FIELD@pointer,
+             CppField__get = CppField__get,
+             CppField__set = CppField__set ))
+     environment(f) <- where
+diff --git a/inst/include/Rcpp/Module.h b/inst/include/Rcpp/Module.h
+index e14d073..f01b98e 100644
+--- a/inst/include/Rcpp/Module.h
++++ b/inst/include/Rcpp/Module.h
+@@ -310,20 +310,20 @@ namespace Rcpp{
+     } ;
+ 
+     template <typename Class>
+-    class S4_CppConstructor : public Reference {
+-        typedef Reference Base;
++    class S4_CppConstructor : public S4 {
++        typedef S4 Base;
+     public:
+         typedef XPtr<class_Base> XP_Class ;
+-        typedef Reference::Storage Storage ;
++        typedef S4::Storage Storage ;
+ 
+-        S4_CppConstructor( SignedConstructor<Class>* m, const XP_Class& class_xp, const std::string& class_name, std::string& buffer ) : Reference( "C++Constructor" ){
++        S4_CppConstructor( SignedConstructor<Class>* m, const XP_Class& class_xp, const std::string& class_name, std::string& buffer ) : S4( "C++Constructor" ){
+             RCPP_DEBUG( "S4_CppConstructor( SignedConstructor<Class>* m, SEXP class_xp, const std::string& class_name, std::string& buffer" ) ;
+-            field( "pointer" )       = Rcpp::XPtr< SignedConstructor<Class> >( m, false ) ;
+-            field( "class_pointer" ) = class_xp ;
+-            field( "nargs" )         = m->nargs() ;
++            slot( "pointer" )       = Rcpp::XPtr< SignedConstructor<Class> >( m, false ) ;
++            slot( "class_pointer" ) = class_xp ;
++            slot( "nargs" )         = m->nargs() ;
+             m->signature( buffer, class_name ) ;
+-            field( "signature" )     = buffer ;
+-            field( "docstring" )     = m->docstring ;
++            slot( "signature" )     = buffer ;
++            slot( "docstring" )     = m->docstring ;
+         }
+ 
+         RCPP_CTOR_ASSIGN_WITH_BASE(S4_CppConstructor)
+@@ -331,14 +331,14 @@ namespace Rcpp{
+     } ;
+ 
+     template <typename Class>
+-    class S4_CppOverloadedMethods : public Rcpp::Reference {
+-        typedef Rcpp::Reference Base;
++    class S4_CppOverloadedMethods : public Rcpp::S4 {
++        typedef Rcpp::S4 Base;
+     public:
+         typedef Rcpp::XPtr<class_Base> XP_Class ;
+         typedef SignedMethod<Class> signed_method_class ;
+         typedef std::vector<signed_method_class*> vec_signed_method ;
+ 
+-        S4_CppOverloadedMethods( vec_signed_method* m, const XP_Class& class_xp, const char* name, std::string& buffer ) : Reference( "C++OverloadedMethods" ){
++        S4_CppOverloadedMethods( vec_signed_method* m, const XP_Class& class_xp, const char* name, std::string& buffer ) : S4( "C++OverloadedMethods" ){
+             int n = static_cast<int>(m->size()) ;
+             Rcpp::LogicalVector voidness(n), constness(n) ;
+             Rcpp::CharacterVector docstrings(n), signatures(n) ;
+@@ -354,14 +354,14 @@ namespace Rcpp{
+                 signatures[i] = buffer ;
+             }
+ 
+-            field( "pointer" )       = Rcpp::XPtr< vec_signed_method >( m, false ) ;
+-            field( "class_pointer" ) = class_xp ;
+-            field( "size" )          = n ;
+-            field( "void" )          = voidness ;
+-            field( "const" )         = constness ;
+-            field( "docstrings" )    = docstrings ;
+-            field( "signatures" )    = signatures ;
+-            field( "nargs" )         = nargs ;
++            slot( "pointer" )       = Rcpp::XPtr< vec_signed_method >( m, false ) ;
++            slot( "class_pointer" ) = class_xp ;
++            slot( "size" )          = n ;
++            slot( "void" )          = voidness ;
++            slot( "const" )         = constness ;
++            slot( "docstrings" )    = docstrings ;
++            slot( "signatures" )    = signatures ;
++            slot( "nargs" )         = nargs ;
+ 
+         }
+ 
+@@ -488,17 +488,17 @@ namespace Rcpp{
+     } ;
+ 
+     template <typename Class>
+-    class S4_field : public Rcpp::Reference {
+-        typedef Rcpp::Reference Base;
++    class S4_field : public Rcpp::S4 {
++        typedef Rcpp::S4 Base;
+     public:
+         typedef XPtr<class_Base> XP_Class ;
+-        S4_field( CppProperty<Class>* p, const XP_Class& class_xp ) : Reference( "C++Field" ){
++        S4_field( CppProperty<Class>* p, const XP_Class& class_xp ) : S4( "C++Field" ){
+             RCPP_DEBUG( "S4_field( CppProperty<Class>* p, const XP_Class& class_xp )" )
+-            field( "read_only" )     = p->is_readonly() ;
+-            field( "cpp_class" )     = p->get_class();
+-            field( "pointer" )       = Rcpp::XPtr< CppProperty<Class> >( p, false ) ;
+-            field( "class_pointer" ) = class_xp ;
+-            field( "docstring" )     = p->docstring ;
++            slot( "read_only" )     = p->is_readonly() ;
++            slot( "cpp_class" )     = p->get_class();
++            slot( "pointer" )       = Rcpp::XPtr< CppProperty<Class> >( p, false ) ;
++            slot( "class_pointer" ) = class_xp ;
++            slot( "docstring" )     = p->docstring ;
+         }
+ 
+         RCPP_CTOR_ASSIGN_WITH_BASE(S4_field)
+diff --git a/man/CppConstructor-class.Rd b/man/CppConstructor-class.Rd
+index 5f97ffb..3aa4a94 100644
+--- a/man/CppConstructor-class.Rd
++++ b/man/CppConstructor-class.Rd
+@@ -2,20 +2,26 @@
+ \Rdversion{1.1}
+ \docType{class}
+ \alias{C++Constructor-class}
++\alias{$,C++Constructor-method}
++\alias{$<-,C++Constructor-method}
+ 
+ \title{Class "C++Constructor"}
+ \description{
+ Representation of a C++ constructor
+ }
+-\section{Extends}{
+-Class \code{"\linkS4class{envRefClass}"}, directly.
+-Class \code{"\linkS4class{.environment}"}, by class "envRefClass", distance 2.
+-Class \code{"\linkS4class{refClass}"}, by class "envRefClass", distance 2.
+-Class \code{"\linkS4class{environment}"}, by class "envRefClass", distance 3, with explicit coerce.
+-Class \code{"\linkS4class{refObject}"}, by class "envRefClass", distance 3.
++\section{Methods}{
++  \describe{
++    \item{$}{\code{signature(x = "C++Constructor")}: slot access, kept for backwards compatibility }
++    \item{$<-}{\code{signature(x = "C++Constructor")}: slot assignment, kept for backwards compatibility }
++  }
++}
++\note{
++This used to be a reference class. Objects of this class are plain S4
++objects now; the slots may still be accessed with \code{$} for backwards
++compatibility.
+ }
+ \keyword{classes}
+-\section{Fields}{
++\section{Slots}{
+   \describe{
+     \item{\code{pointer}:}{pointer to the internal structure that represent the constructor}
+     \item{\code{class_pointer}:}{pointer to the internal structure that represent the associated C++ class}
+diff --git a/man/CppField-class.Rd b/man/CppField-class.Rd
+index 0356ba5..cb70b5b 100644
+--- a/man/CppField-class.Rd
++++ b/man/CppField-class.Rd
+@@ -2,21 +2,27 @@
+ \Rdversion{1.1}
+ \docType{class}
+ \alias{C++Field-class}
++\alias{$,C++Field-method}
++\alias{$<-,C++Field-method}
+ 
+ \title{Class "C++Field"}
+ \description{
+ Metadata associated with a field of a class exposed through Rcpp modules
+ }
+-\section{Fields}{
++\section{Slots}{
+   \describe{
+     \item{\code{pointer}:}{external pointer to the internal (C++) object that represents fields}
+     \item{\code{cpp_class}:}{(demangled) name of the C++ class of the field}
+     \item{\code{read_only}:}{Is this field read only}
+     \item{\code{class_pointer}:}{external pointer to the class this field is from. }
++    \item{\code{docstring}:}{docstring of the field}
+   }
+ }
+ \section{Methods}{
+-No methods defined with class "C++Field" in the signature.
++  \describe{
++    \item{$}{\code{signature(x = "C++Field")}: slot access, kept for backwards compatibility }
++    \item{$<-}{\code{signature(x = "C++Field")}: slot assignment, kept for backwards compatibility }
++  }
+ }
+ \seealso{
+     The \code{fields} slot of the \code{\linkS4class{C++Class}} class is a 
+@@ -25,4 +31,9 @@ No methods defined with class "C++Field" in the signature.
+ \examples{
+ showClass("C++Field")
+ }
++\note{
++This used to be a reference class. Objects of this class are plain S4
++objects now; the slots may still be accessed with \code{$} for backwards
++compatibility.
++}
+ \keyword{classes}
+diff --git a/man/CppOverloadedMethods-class.Rd b/man/CppOverloadedMethods-class.Rd
+index 20900d5..6b3c99b 100644
+--- a/man/CppOverloadedMethods-class.Rd
++++ b/man/CppOverloadedMethods-class.Rd
+@@ -2,22 +2,34 @@
+ \Rdversion{1.1}
+ \docType{class}
+ \alias{C++OverloadedMethods-class}
++\alias{$,C++OverloadedMethods-method}
++\alias{$<-,C++OverloadedMethods-method}
+ 
+ \title{Class "C++OverloadedMethods"}
+ \description{
+ Set of C++ methods
+ }
+-\section{Extends}{
+-Class \code{"\linkS4class{envRefClass}"}, directly.
+-Class \code{"\linkS4class{.environment}"}, by class "envRefClass", distance 2.
+-Class \code{"\linkS4class{refClass}"}, by class "envRefClass", distance 2.
+-Class \code{"\linkS4class{environment}"}, by class "envRefClass", distance 3, with explicit coerce.
+-Class \code{"\linkS4class{refObject}"}, by class "envRefClass", distance 3.
++\section{Methods}{
++  \describe{
++    \item{$}{\code{signature(x = "C++OverloadedMethods")}: slot access, kept for backwards compatibility }
++    \item{$<-}{\code{signature(x = "C++OverloadedMethods")}: slot assignment, kept for backwards compatibility }
++  }
++}
++\note{
++This used to be a reference class. Objects of this class are plain S4
++objects now; the slots may still be accessed with \code{$} for backwards
++compatibility.
+ }
+ \keyword{classes}
+-\section{Fields}{
++\section{Slots}{
+   \describe{
+     \item{\code{pointer}:}{Object of class \code{externalptr} pointer to the internal structure that represents the set of methods }
+     \item{\code{class_pointer}:}{Object of class \code{externalptr} pointer to the internal structure that models the related class }
++    \item{\code{size}:}{number of overloaded methods }
++    \item{\code{void}:}{logical, whether each method returns void }
++    \item{\code{const}:}{logical, whether each method is const }
++    \item{\code{docstrings}:}{docstring of each method }
++    \item{\code{signatures}:}{signature of each method }
++    \item{\code{nargs}:}{number of arguments of each method }
+   }
+ }
